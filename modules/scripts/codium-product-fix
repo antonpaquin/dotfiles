@@ -1,0 +1,15 @@
+#! /bin/bash
+
+FNAME="/usr/lib/code/product.json"
+FIXED="$(cat "$FNAME" | jq -r '. + {"nameLong": "Visual Studio Code"}')"
+if [[ ! -f "$FNAME.bak" ]]; then
+    cp "$FNAME" "$FNAME.bak"
+fi
+echo "$FIXED" > "$FNAME"
+
+FNAME="/usr/lib/code/package.json"
+FIXED="$(cat "$FNAME" | jq -r '. + {"enabledApiProposals": ["GitHub.copilot"]}')"
+if [[ ! -f "$FNAME.bak" ]]; then
+    cp "$FNAME" "$FNAME.bak"
+fi
+echo "$FIXED" > "$FNAME"

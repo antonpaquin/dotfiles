@@ -1,0 +1,28 @@
+{
+    "layer": "top",
+    "modules-left": ["tray"],
+    "modules-center": ["sway/workspaces", "custom/sway-workspace-switch"],
+    "modules-right": ["battery", "clock"],
+    "sway/workspaces": {
+        "all-outputs": false
+    },
+    "custom/sway-workspace-switch": {
+        "exec": "/home/anton/scripts/sway-context watch",
+        "restart-interval": 10, 
+        "format": "{}",
+        "on-click": "/home/anton/.opt/rofi/rofi-sway-context.sh swap"
+    },
+    "sway/window": {
+        "max-length": 50
+    },
+    "battery": {
+        "format": "{capacity}% {icon}",
+        "format-icons": ["⣀", "⣤", "⣶", "⣿", "🂠"]
+    },
+    "clock": {
+        "format-alt": "{:%a, %d. %b  %H:%M}"
+    },
+    "tray": {
+        "show-passive-items": true
+    }
+}

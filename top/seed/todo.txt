@@ -1,0 +1,11 @@
+backgrounds
+    - want to cycle randomly
+    - ... so save photos to a dir in nfs:/home/anton
+    - ... so seed has a standard mount somewhere
+        - means I need to forward 2049 across kattegat
+    - then also do the sh script
+
+waybar
+    - waybar?
+
+homelab media-srv wants an auth password?

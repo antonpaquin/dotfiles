@@ -1,0 +1,334 @@
+#! /usr/bin/env python
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from typing import Dict, List, Any, Optional, Tuple
+
+
+T_JSON=Dict[str, Any]
+
+HOME=os.environ.get('HOME')
+backup_file = f'{HOME}/.run/firefox-sway-backup'
+
+
+class FirefoxWindow:
+    def __init__(self, tabs: List['FirefoxTab'], selected: int):
+        self.tabs = tabs
+        self.selected = selected
+
+    def current_title(self) -> str:
+        # NB firefox is 1-indexed
+        return self.tabs[self.selected - 1].current_title()
+
+    def to_json(self) -> T_JSON:
+        return {
+            'tabs': [tab.to_json() for tab in self.tabs],
+            'selected': self.selected,
+        }
+
+    @staticmethod
+    def from_json(data: T_JSON) -> 'FirefoxWindow':
+        return FirefoxWindow(
+            tabs=[FirefoxTab.from_json(tab) for tab in data['tabs']],
+            selected=data['selected'],
+        )
+
+    def similarity(self, other: 'FirefoxWindow') -> float:
+        if len(self.tabs) == len(other.tabs):
+            if all(self_tab.current_title() == other_tab.current_title() for self_tab, other_tab in zip(self.tabs, other.tabs)):
+                return 1
+            else:
+                return sum(jaccard(self_tab.current_title(), other_tab.current_title(), 3) for self_tab, other_tab in zip(self.tabs, other.tabs)) / len(self.tabs)
+        # Kinda wanna do a pairwise search but I dunno how to do that efficiently
+        # is firefox generating new tabs between backups? Hope not
+        return 0
+
+
+class FirefoxTab:
+    def __init__(self, entries: List['FirefoxEntry'], index: int):
+        self.entries = entries
+        self.index = index
+
+    def current_title(self) -> str:
+        # NB firefox is 1-indexed
+        if self.index <= len(self.entries):
+            return self.entries[self.index - 1].title
+        elif self.entries:
+            self.entries[-1].title
+        else:
+            return ''
+
+    def to_json(self) -> T_JSON:
+        return {
+            'entries': [entry.to_json() for entry in self.entries],
+            'index': self.index,
+        }
+
+    @staticmethod
+    def from_json(data: T_JSON) -> 'FirefoxTab':
+        return FirefoxTab(
+            entries=[FirefoxEntry.from_json(entry) for entry in data['entries']],
+            index=data['index'],
+        )
+
+
+class FirefoxEntry:
+    def __init__(self, title: str):
+        self.title = title
+
+    def to_json(self) -> T_JSON:
+        return {
+            'title': self.title,
+        }
+
+    @staticmethod
+    def from_json(data: T_JSON) -> 'FirefoxEntry':
+        return FirefoxEntry(
+            title=data['title'],
+        )
+
+
+class SwayDesktop:
+    def __init__(self, name: str, windows: List['SwayWindow']):
+        self.name = name
+        self.windows = windows
+
+    def to_json(self) -> T_JSON:
+        return {
+            'name': self.name,
+            'windows': [window.to_json() for window in self.windows],
+        }
+
+    def all_titles(self) -> List[str]:
+        return [window.title for window in self.windows]
+
+    def filter_class(self, class_: str) -> 'SwayDesktop':
+        return SwayDesktop(self.name, windows=[window for window in self.windows if window.class_ == class_])
+
+
+class SwayWindow:
+    def __init__(self, pid: int, title: Optional[str], class_: Optional[str], app_id: Optional[str], sway_id: int) -> None:
+        self.pid = pid
+        self.title = title
+        self.class_ = class_
+        self.app_id = app_id
+        self.sway_id = sway_id
+
+    def to_json(self) -> T_JSON:
+        return {
+            'pid': self.pid,
+            'title': self.title,
+            'class': self.class_,
+            'app_id': self.app_id,
+            'sway_id': self.sway_id,
+        }
+
+
+def jaccard(s1: str, s2: str, n: int) -> float:
+    s1s = set(s1[i:i+n] for i in range(max(len(s1) - n + 1, 1)))
+    s2s = set(s2[i:i+n] for i in range(max(len(s2) - n + 1, 1)))
+    return len(s1s & s2s) / len(s1s | s2s)
+
+
+def backup() -> None:
+    profiles = collect_firefox_profiles()
+    data = gen_backup(profiles)
+    with open(backup_file, 'w') as f:
+        json.dump(data, f, indent=4)
+
+
+def collect_firefox_profiles() -> List[str]:
+    return [f for f in os.listdir(f'{HOME}/.mozilla/firefox') if 'default-release' in f]
+
+
+def gen_backup(profiles: List[str]) -> T_JSON:
+    firefox = []
+    for profile in profiles:
+        firefox.extend(parse_firefox(get_firefox_session(profile)))
+    sway = [s.filter_class('firefox') for s in parse_sway(get_sway_session())]
+
+    data_matches = []
+    for idx, window in enumerate(firefox):
+        sway_match = match_window(window, sway)
+        if sway_match:
+            _, desktop = sway_match
+            data_matches.append({
+                'firefox': idx,
+                'sway': desktop.name
+            })
+        else:
+            print(f'Unmatched Window {window.current_title()}', file=sys.stderr)
+
+    data = {
+        'firefox': [window.to_json() for window in firefox],
+        'match': data_matches,
+    }
+
+    return data
+
+
+def restore() -> None:
+    profiles = collect_firefox_profiles()
+    with open(backup_file, 'r') as f:
+        backup = json.load(f)
+    targets = get_restore_targets(profiles, backup)
+    for sway_id, target in targets.items():
+        sway_send(sway_id, target)
+
+
+def get_restore_targets(profiles: List[str], backup: T_JSON) -> Dict[int, str]:
+    firefox = []
+    for profile in profiles:
+        firefox.extend(parse_firefox(get_firefox_session(profile)))
+    sway = [s.filter_class('firefox') for s in parse_sway(get_sway_session())]
+
+    backup_ff = [FirefoxWindow.from_json(window) for window in backup['firefox']]
+    backup_match = {m['firefox']: m['sway'] for m in backup['match']}
+    sway_ctx_current = get_swayctx_current()
+
+    targets = {}
+    for ff_window in firefox:
+        idx = identify_firefox(ff_window, backup_ff)
+        if idx not in backup_match:
+            print(f'Unmatched window {ff_window.current_title()}', file=sys.stderr)
+            continue
+        dest_workspace = backup_match[idx]
+        sway_match = match_window(ff_window, sway)
+        if sway_match:
+            sway_window, sway_desktop = sway_match
+            if sway_desktop.name != dest_workspace:
+                if dest_workspace.startswith(sway_ctx_current) and dest_workspace[len(sway_ctx_current):].isnumeric():
+                    dest_workspace = dest_workspace[len(sway_ctx_current):]
+                targets[sway_window.sway_id] = dest_workspace
+        else:
+            print(f'Unmatched window {ff_window.current_title()}', file=sys.stderr)
+    
+    return targets
+
+
+def sway_send(window_id: int, workspace: str) -> None:
+    subprocess.run(['swaymsg', f'[con_id={window_id}]', 'move', 'workspace', workspace])
+
+
+def match_window(ff_window: FirefoxWindow, sway: List[SwayDesktop]) -> Optional[Tuple[SwayWindow, SwayDesktop]]:
+    res = {}
+    for desktop in sway:
+        match = match_sway_window(ff_window, desktop)
+        if match:
+            return (match, desktop)
+    return None
+
+
+def match_sway_window(window: FirefoxWindow, desktop: SwayDesktop) -> Optional[SwayWindow]:
+    title = window.current_title()
+    for sway_window in desktop.windows:
+        if title in sway_window.title:
+            return sway_window
+    return None
+
+
+def identify_firefox(window: FirefoxWindow, backup_ff: List[FirefoxWindow]) -> int:
+    scores = []
+    for idx, backup_window in enumerate(backup_ff):
+        score = window.similarity(backup_window)
+        scores.append((score, idx))
+    scores.sort(reverse=True)
+    return scores[0][1]
+
+
+def get_sway_session() -> T_JSON:
+    session = subprocess.check_output(['swaymsg', '-t', 'get_tree', '-r'])
+    return json.loads(session)
+
+
+def get_swayctx_current() -> str:
+    return subprocess.check_output(['sway-context', 'current']).decode('utf-8').strip()
+
+
+def parse_sway(session: T_JSON) -> List[SwayDesktop]:
+    desktops = sway_unpack_desktops(session)
+    res = []
+    window_rename = {'name': 'title', 'class': 'class_'}
+    current_desktop = get_swayctx_current()
+    for desktop, windows in desktops.items():
+        sway_windows = []
+        for window in windows:
+            window_args = {window_rename.get(k, k): v for k, v in window.items()}
+            sway_windows.append(SwayWindow(**window_args))
+        if desktop.isnumeric():
+            desktop = f'{current_desktop}{desktop}'
+        res.append(SwayDesktop(desktop, sway_windows))
+    return res
+
+
+def sway_unpack_desktops(sway_session: T_JSON, res: Optional[Dict[str, List[Dict[str, str]]]] = None, parent_workspace: Optional[str] = None) -> Dict[str, List[Dict[str, str]]]:
+    if res is None:
+        res = {}
+
+    for node in sway_session['nodes']:
+        if node['type'] == 'workspace':
+            if node['name'] not in res:
+                res[node['name']] = []
+            sway_unpack_desktops(node, res, node['name'])
+        else:
+            sway_unpack_desktops(node, res, parent_workspace)
+
+        if parent_workspace and node.get('pid', None):
+            res[parent_workspace].append({
+                'pid': node['pid'],
+                'app_id': node.get('app_id', None),
+                'name': node.get('name', None),
+                'class': node.get('window_properties', {}).get('class', None),
+                'sway_id': node['id'],
+            })
+
+    return res
+
+
+def get_firefox_session(profile: str) -> T_JSON:
+    session = subprocess.check_output(['lz4jsoncat', f'{HOME}/.mozilla/firefox/{profile}/sessionstore-backups/recovery.jsonlz4'])
+    return json.loads(session)
+
+
+def parse_firefox(session: T_JSON) -> List[FirefoxWindow]:
+    res = []
+    for window in session['windows']:
+        tabs = []
+        for tab in window['tabs']:
+            # I think "entries" is the history
+            # (ChatGPT told me it was iframes / documents in the page -- total confabulation)
+            entries = []
+            for entry in tab['entries']:
+                entries.append(FirefoxEntry(entry['title']))
+            tabs.append(FirefoxTab(entries, tab['index']))
+        res.append(FirefoxWindow(tabs, window['selected']))
+    return res
+
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser()
+
+    subparsers = parser.add_subparsers(dest='command')
+
+    backup_parser = subparsers.add_parser('backup')
+    backup_parser.set_defaults(command='backup')
+
+    restore_parser = subparsers.add_parser('restore')
+    restore_parser.set_defaults(command='restore')
+
+    return parser.parse_args()
+
+
+def cli():
+    args = parse_cli_args()
+    if args.command == 'backup':
+        backup()
+    elif args.command == 'restore':
+        restore()
+
+
+if __name__ == '__main__':
+    cli()

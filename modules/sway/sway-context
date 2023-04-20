@@ -1,0 +1,103 @@
+#! /bin/bash
+
+RUNFILE="/var/run/user/$(id -u)/sway-context"
+CURRENT_LOG="/var/run/user/$(id -u)/sway-context-current"  
+
+function init() {
+    WK="$(swaymsg -t get_workspaces -r)"
+    FOCUSED="$(echo "$WK" | jq -r 'map(select(.focused))[0].name')"
+    echo '{"cur": "default", "focused": { "default": "'"$FOCUSED"'"}}' > $RUNFILE
+    echo 'default' > "$CURRENT_LOG"  # could be made a fifo?
+}
+
+function swap_context() {
+    STATE="$(cat "$RUNFILE")"
+    CUR="$(echo "$STATE" | jq -r '.cur')"
+    NXT="$1"
+
+    if [[ "$CUR" == "$NXT" ]]; then
+        return 0
+    fi
+
+    NXT_FOCUS="$(echo "$STATE" | jq -r '.focused."'"$NXT"'"')"
+    if [[ "$NXT_FOCUS" == "null" ]]; then
+        NXT_FOCUS="1"
+    fi
+    
+    WK="$(swaymsg -t get_workspaces -r)"
+    ALL_WORKSPACES="$(echo "$WK" | jq -r '.[].name')"
+    CUR_FOCUSED="$(echo "$WK" | jq -r 'map(select(.focused))[0].name')"
+    CUR_WORKSPACES="$(echo "$ALL_WORKSPACES" | grep -E '^[0-9]')"
+    NXT_WORKSPACES="$(echo "$ALL_WORKSPACES" | grep -E '^'"$NXT"'[0-9]')"
+
+    if [[ "$CUR_WORKSPACES" != "" ]]; then
+        while read -r wkname; do
+            swaymsg rename workspace "$wkname" to "$CUR$wkname"
+        done < <(echo "$CUR_WORKSPACES")
+    fi
+
+    if [[ "$NXT_WORKSPACES" != "" ]]; then
+        while read -r wkname; do
+            wkid="$(echo "$wkname" | grep -o -e '[0-9]*$')"
+            swaymsg rename workspace "$wkname" to "$wkid"
+        done < <(echo "$NXT_WORKSPACES")
+    fi
+
+    echo "$STATE" | jq -r '. * {"cur": "'"$NXT"'", "focused": {"'"$CUR"'": "'"$CUR_FOCUSED"'"}}' > $RUNFILE
+    echo "$NXT" >> "$CURRENT_LOG"
+    swaymsg workspace "$NXT_FOCUS"
+}
+
+function list_contexts() {
+    STATE="$(cat "$RUNFILE")"
+    CUR="$(echo "$STATE" | jq -r '.cur')"
+    WK="$(swaymsg -t get_workspaces -r)"
+    CTXS="$( (echo "$CUR"; echo "$WK" | swaymsg -t get_workspaces -r  | jq -r '.[].name') | grep -o -E '^[^0-9]+' | sort | uniq)"
+    CTXS_JSON="$(printf "%s" "$CTXS" | jq -R -s 'split("\n")')"
+    echo "{\"cur\": \"$CUR\", \"contexts\": "$CTXS_JSON"}" | jq -r 
+}
+
+function send_context() {
+    NXT="$1"
+    STATE="$(cat "$RUNFILE")"
+    CUR="$(echo "$STATE" | jq -r '.cur')"
+
+    if [[ "$CUR" == "$NXT" ]]; then
+        return 0
+    fi
+
+    WK="$(swaymsg -t get_workspaces -r)"
+    FOCUSED="$(echo "$WK" | jq -r 'map(select(.focused))[0].name')"
+
+    swaymsg move container to workspace "$NXT$FOCUSED"
+}
+
+function get_current() {
+    STATE="$(cat "$RUNFILE")"
+    CUR="$(echo "$STATE" | jq -r '.cur')"
+    echo "$CUR"
+}
+
+function watch_current() {
+    if [[ ! -f "$CURRENT_LOG" ]]; then
+        echo "default" > "$CURRENT_LOG"
+    fi
+
+    while sleep 1; do
+        tail -f "$CURRENT_LOG"
+    done
+}
+
+if [[ "$1" == "init" ]]; then
+   init
+elif [[ "$1" == "swap" ]]; then
+   swap_context "$2"
+elif [[ "$1" == "send" ]]; then
+   send_context "$2"
+elif [[ "$1" == "list" ]]; then
+    list_contexts
+elif [[ "$1" == "current" ]]; then
+    get_current
+elif [[ "$1" == "watch" ]]; then
+    watch_current
+fi
